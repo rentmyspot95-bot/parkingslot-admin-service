@@ -22,17 +22,22 @@ async function bootstrap(): Promise<void> {
   app.setGlobalPrefix('api', { exclude: ['health'] });
   app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
 
-  const origins = (process.env.ADMIN_CONSOLE_ORIGIN ?? 'http://localhost:5273')
-    .split(',')
-    .map((o) => o.trim())
-    .filter(Boolean);
-  app.enableCors({
-    origin: origins,
-    credentials: true,
-    allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'X-Request-Id'],
-    exposedHeaders: ['X-Request-Id'],
-    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-  });
+  // CORS is owned by this service when reached directly (its own public domain).
+  // When fronted by the nginx gateway, the gateway sets CORS — set
+  // ADMIN_CORS_ENABLED=false so the two don't emit duplicate headers.
+  if (process.env.ADMIN_CORS_ENABLED !== 'false') {
+    const origins = (process.env.ADMIN_CONSOLE_ORIGIN ?? 'http://localhost:5273')
+      .split(',')
+      .map((o) => o.trim())
+      .filter(Boolean);
+    app.enableCors({
+      origin: origins,
+      credentials: true,
+      allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'X-Request-Id'],
+      exposedHeaders: ['X-Request-Id'],
+      methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+    });
+  }
 
   app.useGlobalPipes(
     new ValidationPipe({
