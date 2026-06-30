@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "ParkingSlot Admin API — BFF/aggregator over the domain services for the operations console (/api/v1/admin/**)",
   "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "build": "nest build",
     "start": "node dist/main.js",

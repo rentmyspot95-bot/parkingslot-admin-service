@@ -1,3 +1,4 @@
+import './crypto-polyfill';
 import 'reflect-metadata';
 process.env.TZ = 'Asia/Kolkata';
 import { Logger, ValidationPipe, VersioningType } from '@nestjs/common';
