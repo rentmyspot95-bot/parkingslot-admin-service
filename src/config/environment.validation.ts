@@ -17,6 +17,12 @@ export function validateEnvironment(config: Record<string, unknown>) {
     DB_SSL: String(config.DB_SSL ?? 'false'),
     TYPEORM_LOGGING: String(config.TYPEORM_LOGGING ?? 'false'),
 
+    // Read-only connection to the shared domain database (`parkslot`) that the
+    // marketplace/finance/engagement services write to. Falls back to the same
+    // host/credentials as the admin DB with the `parkslot` database name.
+    UPSTREAM_DATABASE_URL: String(config.UPSTREAM_DATABASE_URL ?? '').trim() || undefined,
+    UPSTREAM_DB_NAME: String(config.UPSTREAM_DB_NAME ?? 'parkslot'),
+
     ADMIN_JWT_SECRET: String(config.ADMIN_JWT_SECRET ?? '').trim(),
     ADMIN_JWT_ACCESS_TTL: Number(config.ADMIN_JWT_ACCESS_TTL ?? 900),
     ADMIN_REFRESH_SECRET: String(config.ADMIN_REFRESH_SECRET ?? '').trim(),

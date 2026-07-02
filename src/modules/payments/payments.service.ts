@@ -1,11 +1,11 @@
 import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { paginate } from '../../common/util/paginate';
+import { toPaise } from '../../common/util/money';
 import type { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { NotFoundDomainException } from '../../common/errors/domain.exception';
-
-/** ISO date for `d` days ago — keeps the seed fixtures stable and DB-free. */
-const daysAgo = (d: number) => new Date(Date.now() - d * 86_400_000).toISOString();
-const minsAhead = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
+import { UpstreamPayment, UPSTREAM_CONNECTION } from '../../database/upstream/upstream.entities';
 
 interface Refund {
   id: string;
@@ -38,64 +38,43 @@ interface RefundRecord {
   at: string;
 }
 
-// Seed fixtures copied from the admin console mock (src/shared/mock/data.ts).
-// Money is in paise (integer minor units).
-const payments: Payment[] = [
-  {
-    id: 'pay_1',
-    bookingId: 'bkg_1',
+/** Maps a real payment row (rupees) to the console's Payment contract (paise). */
+function toPayment(p: UpstreamPayment): Payment {
+  const refunds: Refund[] =
+    p.refundAmount > 0
+      ? [
+          {
+            id: p.refundId ?? `rfnd_${p.id.slice(0, 8)}`,
+            amount: toPaise(p.refundAmount),
+            reason: p.refundReason ?? '',
+            by: '',
+            at: (p.refundedAt ?? p.createdAt).toISOString(),
+          },
+        ]
+      : [];
+  return {
+    id: p.id,
+    bookingId: p.bookingId,
     gateway: 'razorpay',
-    gatewayPaymentId: 'rzp_pay_AbC123',
-    amount: 12000,
-    currency: 'INR',
-    status: 'captured',
-    refunds: [],
-    createdAt: daysAgo(2),
-  },
-  {
-    id: 'pay_2',
-    bookingId: 'bkg_2',
-    gateway: 'razorpay',
-    gatewayPaymentId: 'rzp_pay_DeF456',
-    amount: 12000,
-    currency: 'INR',
-    status: 'authorized',
-    refunds: [],
-    createdAt: minsAhead(-38),
-  },
-  {
-    id: 'pay_3',
-    bookingId: 'bkg_3',
-    gateway: 'razorpay',
-    gatewayPaymentId: 'rzp_pay_GhI789',
-    amount: 9000,
-    currency: 'INR',
-    status: 'refunded',
-    refunds: [{ id: 'rfnd_1', amount: 9000, reason: 'Auto-rejected request', by: 'adm_1', at: daysAgo(1) }],
-    createdAt: daysAgo(1),
-  },
-  {
-    id: 'pay_4',
-    bookingId: 'bkg_4',
-    gateway: 'razorpay',
-    gatewayPaymentId: 'rzp_pay_JkL012',
-    amount: 15000,
-    currency: 'INR',
-    status: 'partially_refunded',
-    refunds: [{ id: 'rfnd_2', amount: 5000, reason: 'Partial goodwill', by: 'adm_1', at: daysAgo(2) }],
-    createdAt: daysAgo(3),
-  },
-];
-
-const refunds: RefundRecord[] = [
-  { id: 'rfnd_1', paymentId: 'pay_3', bookingId: 'bkg_3', amount: 9000, reason: 'Auto-rejected request', status: 'processed', by: 'adm_1', at: daysAgo(1) },
-  { id: 'rfnd_2', paymentId: 'pay_4', bookingId: 'bkg_4', amount: 5000, reason: 'Partial goodwill', status: 'processed', by: 'adm_1', at: daysAgo(2) },
-];
+    gatewayPaymentId: p.razorpayPaymentId ?? p.razorpayOrderId ?? '',
+    amount: toPaise(p.amount),
+    currency: p.currency,
+    status: p.status,
+    refunds,
+    createdAt: p.createdAt.toISOString(),
+  };
+}
 
 @Injectable()
 export class PaymentsService {
-  listPayments(query: PaginationQueryDto) {
-    return paginate(payments as unknown as Record<string, unknown>[], {
+  constructor(
+    @InjectRepository(UpstreamPayment, UPSTREAM_CONNECTION)
+    private readonly payments: Repository<UpstreamPayment>,
+  ) {}
+
+  async listPayments(query: PaginationQueryDto) {
+    const rows = (await this.payments.find({ order: { createdAt: 'DESC' } })).map(toPayment);
+    return paginate(rows as unknown as Record<string, unknown>[], {
       page: query.page,
       limit: query.limit,
       q: query.q,
@@ -105,14 +84,15 @@ export class PaymentsService {
     });
   }
 
-  getPayment(id: string): Payment {
-    const payment = payments.find((p) => p.id === id);
+  async getPayment(id: string): Promise<Payment> {
+    const payment = await this.payments.findOne({ where: { id } });
     if (!payment) throw new NotFoundDomainException('Payment not found');
-    return payment;
+    return toPayment(payment);
   }
 
   refund(id: string, body: { amount: number; reason: string }) {
-    // Stub: a real implementation would call the gateway and persist the refund.
+    // Mutations still stub: refunds are executed by the payment-service gateway
+    // flow. This BFF is read-only against the domain DB.
     return {
       refundId: 'rfnd_new',
       paymentId: id,
@@ -122,8 +102,20 @@ export class PaymentsService {
     };
   }
 
-  listRefunds(query: PaginationQueryDto) {
-    return paginate(refunds as unknown as Record<string, unknown>[], {
+  async listRefunds(query: PaginationQueryDto) {
+    const rows: RefundRecord[] = (await this.payments.find({ order: { refundedAt: 'DESC' } }))
+      .filter((p) => p.refundAmount > 0)
+      .map((p) => ({
+        id: p.refundId ?? `rfnd_${p.id.slice(0, 8)}`,
+        paymentId: p.id,
+        bookingId: p.bookingId,
+        amount: toPaise(p.refundAmount),
+        reason: p.refundReason ?? '',
+        status: p.status === 'refunded' ? 'processed' : 'processing',
+        by: '',
+        at: (p.refundedAt ?? p.createdAt).toISOString(),
+      }));
+    return paginate(rows as unknown as Record<string, unknown>[], {
       page: query.page,
       limit: query.limit,
       q: query.q,
