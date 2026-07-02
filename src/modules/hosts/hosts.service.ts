@@ -1,30 +1,24 @@
 import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { In, Repository } from 'typeorm';
 import { paginate } from '../../common/util/paginate';
+import { toPaise } from '../../common/util/money';
 import type { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { NotFoundDomainException } from '../../common/errors/domain.exception';
-
-/** Local ISO-date helper (mirrors the console mock's daysAgo). */
-const daysAgo = (d: number): string => new Date(Date.now() - d * 86_400_000).toISOString();
-
-interface KycDoc {
-  type: string;
-  url: string;
-  reviewedBy?: string | null;
-  reviewedAt?: string | null;
-}
-
-interface PayoutAccount {
-  upi?: string | null;
-  bank?: { accountNumber: string; ifsc: string; name: string } | null;
-}
+import {
+  UpstreamBooking,
+  UpstreamPayout,
+  UpstreamUser,
+  UPSTREAM_CONNECTION,
+} from '../../database/upstream/upstream.entities';
 
 interface Host {
   id: string;
   userId: string;
   displayName: string;
   kycStatus: 'unverified' | 'pending' | 'verified' | 'rejected';
-  kycDocs: KycDoc[];
-  payoutAccount?: PayoutAccount | null;
+  kycDocs: unknown[];
+  payoutAccount?: unknown | null;
   listingCount: number;
   rating?: number | null;
   totalEarnings: number;
@@ -44,56 +38,55 @@ interface OwnerApprovalStats {
 
 @Injectable()
 export class HostsService {
-  // Seed copied verbatim from the admin console mock (src/shared/mock/data.ts).
-  private readonly hosts: Host[] = [
-    {
-      id: 'hst_1',
-      userId: 'usr_1',
-      displayName: 'Rahul (MG Road Garage)',
-      kycStatus: 'verified',
-      kycDocs: [
-        {
-          type: 'aadhaar',
-          url: 'https://placehold.co/600x400?text=Aadhaar',
-          reviewedBy: 'adm_1',
-          reviewedAt: daysAgo(100),
-        },
-        {
-          type: 'property_proof',
-          url: 'https://placehold.co/600x400?text=Property+Proof',
-          reviewedBy: 'adm_1',
-          reviewedAt: daysAgo(100),
-        },
-      ],
-      payoutAccount: { upi: 'rahul@upi' },
-      listingCount: 2,
-      rating: 4.6,
-      totalEarnings: 1240000,
-      status: 'active',
-      createdAt: daysAgo(110),
-    },
-    {
-      id: 'hst_2',
-      userId: 'usr_4',
-      displayName: 'Sneha (Indiranagar)',
-      kycStatus: 'pending',
-      kycDocs: [
-        { type: 'aadhaar', url: 'https://placehold.co/600x400?text=Aadhaar' },
-        { type: 'selfie', url: 'https://placehold.co/600x400?text=Selfie' },
-      ],
-      payoutAccount: {
-        bank: { accountNumber: '00112233445', ifsc: 'HDFC0001234', name: 'Sneha Reddy' },
-      },
-      listingCount: 1,
-      rating: null,
-      totalEarnings: 0,
-      status: 'active',
-      createdAt: daysAgo(12),
-    },
-  ];
+  constructor(
+    @InjectRepository(UpstreamUser, UPSTREAM_CONNECTION)
+    private readonly users: Repository<UpstreamUser>,
+    @InjectRepository(UpstreamPayout, UPSTREAM_CONNECTION)
+    private readonly payouts: Repository<UpstreamPayout>,
+    @InjectRepository(UpstreamBooking, UPSTREAM_CONNECTION)
+    private readonly bookings: Repository<UpstreamBooking>,
+  ) {}
 
-  list(query: PaginationQueryDto, kycStatus?: string) {
-    return paginate(this.hosts as unknown as Record<string, unknown>[], {
+  private toHost(u: UpstreamUser, earningsPaise: number): Host {
+    return {
+      id: u.id,
+      userId: u.id,
+      displayName: u.name,
+      // Full KYC document/status detail lives in the kyc-service database, which
+      // is not part of this read connection; verified flag is the best proxy.
+      kycStatus: u.isVerified ? 'verified' : 'pending',
+      kycDocs: [],
+      payoutAccount: null,
+      listingCount: u.totalListings,
+      rating: u.avgRating,
+      totalEarnings: earningsPaise,
+      status: u.isActive ? 'active' : 'suspended',
+      createdAt: u.createdAt.toISOString(),
+    };
+  }
+
+  /** Sum of completed payouts per owner, in paise. */
+  private async earningsMap(ownerIds: string[]): Promise<Map<string, number>> {
+    const ids = [...new Set(ownerIds)];
+    const map = new Map<string, number>();
+    if (!ids.length) return map;
+    const rows = await this.payouts.find({
+      where: { ownerId: In(ids), status: 'completed' },
+    });
+    for (const p of rows) {
+      map.set(p.ownerId, (map.get(p.ownerId) ?? 0) + toPaise(p.amount));
+    }
+    return map;
+  }
+
+  async list(query: PaginationQueryDto, kycStatus?: string) {
+    const raw = await this.users.find({
+      where: { role: In(['owner', 'both']) },
+      order: { createdAt: 'DESC' },
+    });
+    const earnings = await this.earningsMap(raw.map((u) => u.id));
+    const rows = raw.map((u) => this.toHost(u, earnings.get(u.id) ?? 0));
+    return paginate(rows as unknown as Record<string, unknown>[], {
       page: query.page,
       limit: query.limit,
       q: query.q,
@@ -104,37 +97,49 @@ export class HostsService {
     });
   }
 
-  getOne(id: string): Host {
-    const host = this.hosts.find((h) => h.id === id);
-    if (!host) throw new NotFoundDomainException('Host not found');
-    return host;
+  async getOne(id: string): Promise<Host> {
+    const user = await this.users.findOne({ where: { id } });
+    if (!user) throw new NotFoundDomainException('Host not found');
+    const earnings = await this.earningsMap([id]);
+    return this.toHost(user, earnings.get(id) ?? 0);
   }
 
-  decideKyc(id: string, _body: { decision: string; reason?: string }): { ok: true } {
-    this.getOne(id);
+  async decideKyc(id: string, _body: { decision: string; reason?: string }): Promise<{ ok: true }> {
+    await this.getOne(id);
     return { ok: true };
   }
 
-  updateStatus(id: string, _body: { status: string; reason: string }): { ok: true } {
-    this.getOne(id);
+  async updateStatus(id: string, _body: { status: string; reason: string }): Promise<{ ok: true }> {
+    await this.getOne(id);
     return { ok: true };
   }
 
-  flag(id: string, _body: { reason: string }): { ok: true } {
-    this.getOne(id);
+  async flag(id: string, _body: { reason: string }): Promise<{ ok: true }> {
+    await this.getOne(id);
     return { ok: true };
   }
 
-  approvalStats(id: string): OwnerApprovalStats {
-    this.getOne(id);
+  async approvalStats(id: string): Promise<OwnerApprovalStats> {
+    await this.getOne(id);
+    const rows = await this.bookings.find({ where: { owner_id: id } });
+    const pendingCount = rows.filter((b) => b.status === 'pending').length;
+    const approvedCount = rows.filter((b) =>
+      ['confirmed', 'active', 'completed'].includes(b.status),
+    ).length;
+    const rejectedCount = rows.filter((b) => b.status === 'rejected').length;
+    const autoRejectedCount = rows.filter((b) => b.status === 'expired').length;
+    const decided = approvedCount + rejectedCount + autoRejectedCount;
+    const rejectionRate = decided
+      ? Math.round(((rejectedCount + autoRejectedCount) / decided) * 1000) / 10
+      : 0;
     return {
       hostId: id,
-      pendingCount: 1,
-      approvedCount: 4,
-      rejectedCount: 1,
-      autoRejectedCount: 2,
-      avgResponseMinutes: 34,
-      rejectionRate: 12.5,
+      pendingCount,
+      approvedCount,
+      rejectedCount,
+      autoRejectedCount,
+      avgResponseMinutes: null,
+      rejectionRate,
     };
   }
 }

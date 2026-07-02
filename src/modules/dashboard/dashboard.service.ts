@@ -1,7 +1,18 @@
 import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { ILike, MoreThanOrEqual, Repository } from 'typeorm';
+import { toPaise } from '../../common/util/money';
+import {
+  UpstreamBooking,
+  UpstreamListing,
+  UpstreamPayment,
+  UpstreamPayout,
+  UpstreamUser,
+  UPSTREAM_CONNECTION,
+} from '../../database/upstream/upstream.entities';
 
-/** Local ISO-date helper (mirrors data.ts daysAgo). */
-const daysAgo = (d: number): string => new Date(Date.now() - d * 86_400_000).toISOString();
+const DAY = 86_400_000;
+const daysAgoDate = (d: number): Date => new Date(Date.now() - d * DAY);
 
 export interface MetricsQueues {
   pendingKyc: number;
@@ -43,92 +54,184 @@ export interface SearchResult {
 
 @Injectable()
 export class DashboardService {
-  /** Mirrors data.ts metricsOverview(). Counts are derived from the seed fixtures. */
-  overview(): MetricsOverview {
+  constructor(
+    @InjectRepository(UpstreamBooking, UPSTREAM_CONNECTION)
+    private readonly bookings: Repository<UpstreamBooking>,
+    @InjectRepository(UpstreamPayment, UPSTREAM_CONNECTION)
+    private readonly payments: Repository<UpstreamPayment>,
+    @InjectRepository(UpstreamPayout, UPSTREAM_CONNECTION)
+    private readonly payouts: Repository<UpstreamPayout>,
+    @InjectRepository(UpstreamListing, UPSTREAM_CONNECTION)
+    private readonly listings: Repository<UpstreamListing>,
+    @InjectRepository(UpstreamUser, UPSTREAM_CONNECTION)
+    private readonly users: Repository<UpstreamUser>,
+  ) {}
+
+  private async sum(
+    repo: Repository<UpstreamPayment | UpstreamPayout>,
+    column: string,
+    where: string,
+    params: Record<string, unknown>,
+  ): Promise<number> {
+    const row = await repo
+      .createQueryBuilder('t')
+      .select(`COALESCE(SUM(t.${column}), 0)`, 'total')
+      .where(where, params)
+      .getRawOne<{ total: string }>();
+    return Number(row?.total ?? 0);
+  }
+
+  async overview(): Promise<MetricsOverview> {
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const [
+      gmvRupees,
+      bookingsToday,
+      bookings7d,
+      bookings30d,
+      activeListings,
+      newHosts7d,
+      totalPayments,
+      refundedPayments,
+      payoutBacklogRupees,
+      pendingKyc,
+      onHoldPayouts,
+      pendingOwnerApproval,
+    ] = await Promise.all([
+      this.sum(this.payments, 'amount', "t.status = 'captured'", {}),
+      this.bookings.count({ where: { created_at: MoreThanOrEqual(startOfToday) } }),
+      this.bookings.count({ where: { created_at: MoreThanOrEqual(daysAgoDate(7)) } }),
+      this.bookings.count({ where: { created_at: MoreThanOrEqual(daysAgoDate(30)) } }),
+      this.listings.count({ where: { status: 'active' } }),
+      this.users
+        .createQueryBuilder('u')
+        .where("u.role IN ('owner','both')")
+        .andWhere('u.created_at >= :since', { since: daysAgoDate(7) })
+        .getCount(),
+      this.payments.count(),
+      this.payments.count({ where: [{ status: 'refunded' }, { status: 'partially_refunded' }] }),
+      this.sum(this.payouts, 'amount', "t.status = 'processing'", {}),
+      this.users
+        .createQueryBuilder('u')
+        .where("u.role IN ('owner','both')")
+        .andWhere('u.is_verified = false')
+        .getCount(),
+      this.payouts.count({ where: { status: 'processing' } }),
+      this.bookings.count({ where: { status: 'pending' } }),
+    ]);
+
+    const refundRatePct = totalPayments
+      ? Math.round((refundedPayments / totalPayments) * 1000) / 10
+      : 0;
+
     return {
-      gmv: 4820000,
-      bookingsToday: 23,
-      bookings7d: 162,
-      bookings30d: 689,
-      activeListings: 1,
-      newHosts7d: 1,
-      refundRatePct: 3.4,
-      payoutBacklog: 57600,
-      queues: this.queues(),
+      gmv: toPaise(gmvRupees),
+      bookingsToday,
+      bookings7d,
+      bookings30d,
+      activeListings,
+      newHosts7d,
+      refundRatePct,
+      payoutBacklog: toPaise(payoutBacklogRupees),
+      queues: {
+        pendingKyc,
+        // Review moderation and support live outside the parkslot DB.
+        flaggedReviews: 0,
+        openSupport: 0,
+        onHoldPayouts,
+        pendingOwnerApproval,
+      },
     };
   }
 
-  /** Mirrors the queues object inside metricsOverview(). */
-  queues(): MetricsQueues {
+  async queues(): Promise<MetricsQueues> {
+    const [pendingKyc, onHoldPayouts, pendingOwnerApproval] = await Promise.all([
+      this.users
+        .createQueryBuilder('u')
+        .where("u.role IN ('owner','both')")
+        .andWhere('u.is_verified = false')
+        .getCount(),
+      this.payouts.count({ where: { status: 'processing' } }),
+      this.bookings.count({ where: { status: 'pending' } }),
+    ]);
     return {
-      pendingKyc: 1,
-      flaggedReviews: 1,
-      openSupport: 1,
-      onHoldPayouts: 1,
-      pendingOwnerApproval: 1,
+      pendingKyc,
+      flaggedReviews: 0,
+      openSupport: 0,
+      onHoldPayouts,
+      pendingOwnerApproval,
     };
   }
 
-  /** Mirrors data.ts timeseries(): ~30 points of synthetic data. */
-  timeseries(metric: string, range: string): TimeseriesResult {
-    const points: TimeseriesPoint[] = Array.from({ length: 30 }, (_, i) => {
-      const base = metric === 'gmv' ? 120000 : 20;
-      const wobble = Math.round(base * (0.6 + 0.5 * Math.abs(Math.sin(i / 3))));
-      return { t: daysAgo(29 - i), value: wobble };
-    });
+  async timeseries(metric: string, range: string): Promise<TimeseriesResult> {
+    const days = 30;
+    const since = daysAgoDate(days - 1);
+    since.setHours(0, 0, 0, 0);
+
+    const buckets = new Map<string, number>();
+    for (let i = 0; i < days; i++) {
+      buckets.set(new Date(since.getTime() + i * DAY).toISOString().slice(0, 10), 0);
+    }
+
+    if (metric === 'gmv') {
+      const rows = await this.payments.find({
+        where: { status: 'captured', createdAt: MoreThanOrEqual(since) },
+      });
+      for (const p of rows) {
+        const key = p.createdAt.toISOString().slice(0, 10);
+        if (buckets.has(key)) buckets.set(key, (buckets.get(key) ?? 0) + toPaise(p.amount));
+      }
+    } else {
+      const rows = await this.bookings.find({
+        where: { created_at: MoreThanOrEqual(since) },
+      });
+      for (const b of rows) {
+        const key = b.created_at.toISOString().slice(0, 10);
+        if (buckets.has(key)) buckets.set(key, (buckets.get(key) ?? 0) + 1);
+      }
+    }
+
+    const points: TimeseriesPoint[] = [...buckets.entries()].map(([day, value]) => ({
+      t: new Date(`${day}T00:00:00.000Z`).toISOString(),
+      value,
+    }));
     return { metric, range: range || '30d', points };
   }
 
-  /** Mirrors data.ts globalSearch(): cross-entity search over users/hosts/listings/bookings. */
-  search(q: string): SearchResult[] {
-    const ql = (q ?? '').toLowerCase();
+  async search(q: string): Promise<SearchResult[]> {
+    const ql = (q ?? '').trim();
+    if (!ql) return [];
+    const like = `%${ql}%`;
     const out: SearchResult[] = [];
-    if (!ql) return out;
 
-    USERS.filter(
-      (u) =>
-        u.name.toLowerCase().includes(ql) ||
-        u.phone.includes(q) ||
-        (u.email ?? '').includes(ql),
-    ).forEach((u) => out.push({ type: 'user', id: u.id, label: u.name, sublabel: u.phone }));
+    const [users, listings, bookings] = await Promise.all([
+      this.users.find({
+        where: [{ name: ILike(like) }, { phone: ILike(like) }, { email: ILike(like) }],
+        take: 5,
+      }),
+      this.listings.find({ where: { title: ILike(like) }, take: 5 }),
+      this.bookings.find({
+        where: [{ booking_code: ILike(like) }],
+        take: 5,
+      }),
+    ]);
 
-    HOSTS.filter((h) => h.displayName.toLowerCase().includes(ql)).forEach((h) =>
-      out.push({ type: 'host', id: h.id, label: h.displayName }),
+    users.forEach((u) =>
+      out.push({
+        type: u.role === 'owner' || u.role === 'both' ? 'host' : 'user',
+        id: u.id,
+        label: u.name,
+        sublabel: u.phone,
+      }),
     );
-
-    LISTINGS.filter((l) => l.title.toLowerCase().includes(ql)).forEach((l) =>
-      out.push({ type: 'listing', id: l.id, label: l.title, sublabel: l.address }),
+    listings.forEach((l) =>
+      out.push({ type: 'listing', id: l.id, label: l.title ?? '(untitled)' }),
     );
-
-    BOOKINGS.filter((b) => b.id.includes(ql)).forEach((b) =>
-      out.push({ type: 'booking', id: b.id, label: b.id, sublabel: b.listingTitle ?? '' }),
+    bookings.forEach((b) =>
+      out.push({ type: 'booking', id: b.id, label: b.booking_code, sublabel: b.listing_title ?? '' }),
     );
 
     return out.slice(0, 8);
   }
 }
-
-// ── Minimal search fixtures (mirror data.ts) ───────────────────────────────────
-const USERS = [
-  { id: 'usr_1', name: 'Rahul Sharma', phone: '+919800000001', email: 'rahul@example.com' },
-  { id: 'usr_2', name: 'Priya Nair', phone: '+919800000002', email: 'priya@example.com' },
-  { id: 'usr_3', name: 'Imran Khan', phone: '+919800000003', email: null as string | null },
-  { id: 'usr_4', name: 'Sneha Reddy', phone: '+919800000004', email: 'sneha@example.com' },
-];
-
-const HOSTS = [
-  { id: 'hst_1', displayName: 'Rahul (MG Road Garage)' },
-  { id: 'hst_2', displayName: 'Sneha (Indiranagar)' },
-];
-
-const LISTINGS = [
-  { id: 'lst_1', title: 'Covered parking near MG Road Metro', address: '12 MG Road, Bengaluru 560001' },
-  { id: 'lst_2', title: 'Driveway spot, 100m from 100ft Road', address: '4 Indiranagar, Bengaluru 560038' },
-];
-
-const BOOKINGS = [
-  { id: 'bkg_1', listingTitle: 'Covered parking near MG Road Metro' },
-  { id: 'bkg_2', listingTitle: 'Driveway spot, 100m from 100ft Road' },
-  { id: 'bkg_3', listingTitle: 'Driveway spot, 100m from 100ft Road' },
-  { id: 'bkg_4', listingTitle: 'Covered parking near MG Road Metro' },
-];

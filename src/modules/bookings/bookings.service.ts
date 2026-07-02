@@ -1,12 +1,15 @@
 import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { In, Repository } from 'typeorm';
 import { paginate } from '../../common/util/paginate';
+import { toPaise } from '../../common/util/money';
 import type { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { NotFoundDomainException } from '../../common/errors/domain.exception';
-
-const now = Date.now();
-const daysAgo = (d: number): string => new Date(now - d * 86_400_000).toISOString();
-const hoursAhead = (h: number): string => new Date(now + h * 3_600_000).toISOString();
-const minsAhead = (m: number): string => new Date(now + m * 60_000).toISOString();
+import {
+  UpstreamBooking,
+  UpstreamUser,
+  UPSTREAM_CONNECTION,
+} from '../../database/upstream/upstream.entities';
 
 interface Booking {
   id: string;
@@ -42,98 +45,54 @@ interface OwnerApprovalStats {
   rejectionRate: number;
 }
 
-// Seed copied from the admin console mock (src/shared/mock/data.ts → bookings[]).
-const bookings: Booking[] = [
-  {
-    id: 'bkg_1',
-    listingId: 'lst_1',
-    listingTitle: 'Covered parking near MG Road Metro',
-    seekerId: 'usr_2',
-    seekerName: 'Priya Nair',
-    hostId: 'hst_1',
-    hostName: 'Rahul (MG Road Garage)',
-    slot: { start: daysAgo(2), end: daysAgo(2) },
-    vehicleType: 'bike',
-    bayId: 'B-04',
-    amount: 12000,
-    currency: 'INR',
-    commission: 2400,
-    netToHost: 9600,
-    status: 'completed',
-    bookingMode: 'instant_book',
-    autoRejected: false,
-    paymentId: 'pay_1',
-    createdAt: daysAgo(2),
-  },
-  {
-    id: 'bkg_2',
-    listingId: 'lst_2',
-    listingTitle: 'Driveway spot, 100m from 100ft Road',
-    seekerId: 'usr_1',
-    seekerName: 'Rahul Sharma',
-    hostId: 'hst_2',
-    hostName: 'Sneha (Indiranagar)',
-    slot: { start: hoursAhead(6), end: hoursAhead(10) },
-    vehicleType: 'car',
-    amount: 12000,
-    currency: 'INR',
-    commission: 2400,
-    netToHost: 9600,
-    status: 'pending_owner_approval',
-    bookingMode: 'request_to_book',
-    responseDeadline: minsAhead(22),
-    autoRejected: false,
-    paymentId: 'pay_2',
-    createdAt: minsAhead(-38),
-  },
-  {
-    id: 'bkg_3',
-    listingId: 'lst_2',
-    listingTitle: 'Driveway spot, 100m from 100ft Road',
-    seekerId: 'usr_4',
-    seekerName: 'Sneha Reddy',
-    hostId: 'hst_2',
-    hostName: 'Sneha (Indiranagar)',
-    slot: { start: daysAgo(1), end: daysAgo(1) },
-    vehicleType: 'car',
-    amount: 9000,
-    currency: 'INR',
-    commission: 1800,
-    netToHost: 7200,
-    status: 'auto_rejected',
-    bookingMode: 'request_to_book',
-    ownerRejectReason: null,
-    responseDeadline: daysAgo(1),
-    autoRejected: true,
-    paymentId: 'pay_3',
-    createdAt: daysAgo(1),
-  },
-  {
-    id: 'bkg_4',
-    listingId: 'lst_1',
-    listingTitle: 'Covered parking near MG Road Metro',
-    seekerId: 'usr_3',
-    seekerName: 'Imran Khan',
-    hostId: 'hst_1',
-    hostName: 'Rahul (MG Road Garage)',
-    slot: { start: hoursAhead(2), end: hoursAhead(5) },
-    vehicleType: 'car',
-    amount: 15000,
-    currency: 'INR',
-    commission: 3000,
-    netToHost: 12000,
-    status: 'disputed',
-    bookingMode: 'instant_book',
-    autoRejected: false,
-    paymentId: 'pay_4',
-    createdAt: daysAgo(3),
-  },
-];
-
 @Injectable()
 export class BookingsService {
-  list(query: PaginationQueryDto, bookingMode?: string) {
-    return paginate(bookings as unknown as Record<string, unknown>[], {
+  constructor(
+    @InjectRepository(UpstreamBooking, UPSTREAM_CONNECTION)
+    private readonly bookings: Repository<UpstreamBooking>,
+    @InjectRepository(UpstreamUser, UPSTREAM_CONNECTION)
+    private readonly users: Repository<UpstreamUser>,
+  ) {}
+
+  private toBooking(b: UpstreamBooking, names: Map<string, string>): Booking {
+    const deadline = b.owner_response_deadline ?? b.auto_reject_at;
+    return {
+      id: b.id,
+      listingId: b.listing_id,
+      listingTitle: b.listing_title ?? '',
+      seekerId: b.seeker_id,
+      seekerName: names.get(b.seeker_id) ?? b.seeker_id,
+      hostId: b.owner_id,
+      hostName: names.get(b.owner_id) ?? b.owner_id,
+      slot: { start: b.start_time.toISOString(), end: b.end_time.toISOString() },
+      vehicleType: b.vehicle_type ?? '',
+      bayId: b.slot_number ?? undefined,
+      amount: toPaise(b.total_amount),
+      currency: 'INR',
+      commission: toPaise(b.service_fee),
+      netToHost: toPaise(b.base_amount),
+      status: b.status,
+      bookingMode: b.is_instant ? 'instant_book' : 'request_to_book',
+      responseDeadline: deadline ? deadline.toISOString() : undefined,
+      ownerRejectReason: b.status === 'rejected' ? b.cancel_reason : null,
+      autoRejected: b.status === 'expired',
+      paymentId: b.payment_id ?? '',
+      createdAt: b.created_at.toISOString(),
+    };
+  }
+
+  private async nameMap(ids: string[]): Promise<Map<string, string>> {
+    const unique = [...new Set(ids)];
+    if (!unique.length) return new Map();
+    const rows = await this.users.find({ where: { id: In(unique) } });
+    return new Map(rows.map((u) => [u.id, u.name]));
+  }
+
+  async list(query: PaginationQueryDto, bookingMode?: string) {
+    const raw = await this.bookings.find({ order: { created_at: 'DESC' } });
+    const names = await this.nameMap(raw.flatMap((b) => [b.seeker_id, b.owner_id]));
+    const rows = raw.map((b) => this.toBooking(b, names));
+    return paginate(rows as unknown as Record<string, unknown>[], {
       page: query.page,
       limit: query.limit,
       q: query.q,
@@ -144,44 +103,56 @@ export class BookingsService {
     });
   }
 
-  getOne(id: string): Booking {
-    const booking = bookings.find((b) => b.id === id);
+  async getOne(id: string): Promise<Booking> {
+    const booking = await this.bookings.findOne({ where: { id } });
     if (!booking) throw new NotFoundDomainException('Booking not found');
-    return booking;
+    const names = await this.nameMap([booking.seeker_id, booking.owner_id]);
+    return this.toBooking(booking, names);
   }
 
-  cancel(id: string, _body: { reason: string; refund?: boolean }): { ok: true } {
-    this.getOne(id);
+  async cancel(id: string, _body: { reason: string; refund?: boolean }): Promise<{ ok: true }> {
+    await this.getOne(id);
     return { ok: true };
   }
 
-  ownerDecision(
+  async ownerDecision(
     id: string,
     _body: { decision: string; reason?: string; onBehalfOfOwner: boolean },
-  ): { ok: true } {
-    this.getOne(id);
+  ): Promise<{ ok: true }> {
+    await this.getOne(id);
     return { ok: true };
   }
 
-  extendDeadline(id: string, _body: { minutes: number }): { ok: true } {
-    this.getOne(id);
+  async extendDeadline(id: string, _body: { minutes: number }): Promise<{ ok: true }> {
+    await this.getOne(id);
     return { ok: true };
   }
 
-  resolveDispute(id: string, _body: { reason: string }): { ok: true } {
-    this.getOne(id);
+  async resolveDispute(id: string, _body: { reason: string }): Promise<{ ok: true }> {
+    await this.getOne(id);
     return { ok: true };
   }
 
-  ownerApprovalStats(hostId: string): OwnerApprovalStats {
+  async ownerApprovalStats(hostId: string): Promise<OwnerApprovalStats> {
+    const rows = await this.bookings.find({ where: { owner_id: hostId } });
+    const pendingCount = rows.filter((b) => b.status === 'pending').length;
+    const approvedCount = rows.filter((b) =>
+      ['confirmed', 'active', 'completed'].includes(b.status),
+    ).length;
+    const rejectedCount = rows.filter((b) => b.status === 'rejected').length;
+    const autoRejectedCount = rows.filter((b) => b.status === 'expired').length;
+    const decided = approvedCount + rejectedCount + autoRejectedCount;
+    const rejectionRate = decided
+      ? Math.round(((rejectedCount + autoRejectedCount) / decided) * 1000) / 10
+      : 0;
     return {
       hostId,
-      pendingCount: 1,
-      approvedCount: 4,
-      rejectedCount: 1,
-      autoRejectedCount: 2,
-      avgResponseMinutes: 34,
-      rejectionRate: 12.5,
+      pendingCount,
+      approvedCount,
+      rejectedCount,
+      autoRejectedCount,
+      avgResponseMinutes: 0,
+      rejectionRate,
     };
   }
 }

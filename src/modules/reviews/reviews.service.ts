@@ -1,9 +1,14 @@
 import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { In, Repository } from 'typeorm';
 import { paginate } from '../../common/util/paginate';
 import type { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
-
-/** Local ISO-date helper (mirrors the console mock's daysAgo). */
-const daysAgo = (d: number): string => new Date(Date.now() - d * 86_400_000).toISOString();
+import {
+  UpstreamListing,
+  UpstreamReview,
+  UpstreamUser,
+  UPSTREAM_CONNECTION,
+} from '../../database/upstream/upstream.entities';
 
 interface Review {
   id: string;
@@ -21,34 +26,45 @@ interface Review {
 
 @Injectable()
 export class ReviewsService {
-  // Seed copied verbatim from the admin console mock (src/shared/mock/data.ts).
-  private readonly reviews: Review[] = [
-    {
-      id: 'rev_1',
-      listingId: 'lst_1',
-      listingTitle: 'Covered parking near MG Road Metro',
-      seekerId: 'usr_2',
-      seekerName: 'Priya Nair',
-      rating: 2,
-      text: 'Spot was blocked when I arrived, had to wait 20 minutes.',
-      status: 'flagged',
-      createdAt: daysAgo(2),
-    },
-    {
-      id: 'rev_2',
-      listingId: 'lst_1',
-      listingTitle: 'Covered parking near MG Road Metro',
-      seekerId: 'usr_1',
-      seekerName: 'Rahul Sharma',
-      rating: 5,
-      text: 'Great, secure and easy to find.',
-      status: 'visible',
-      createdAt: daysAgo(8),
-    },
-  ];
+  constructor(
+    @InjectRepository(UpstreamReview, UPSTREAM_CONNECTION)
+    private readonly reviews: Repository<UpstreamReview>,
+    @InjectRepository(UpstreamUser, UPSTREAM_CONNECTION)
+    private readonly users: Repository<UpstreamUser>,
+    @InjectRepository(UpstreamListing, UPSTREAM_CONNECTION)
+    private readonly listings: Repository<UpstreamListing>,
+  ) {}
 
-  list(query: PaginationQueryDto) {
-    return paginate(this.reviews as unknown as Record<string, unknown>[], {
+  async list(query: PaginationQueryDto) {
+    const raw = await this.reviews.find({ order: { createdAt: 'DESC' } });
+
+    const userIds = [...new Set(raw.map((r) => r.reviewerId))];
+    const listingIds = [...new Set(raw.map((r) => r.listingId))];
+    const [users, listings] = await Promise.all([
+      userIds.length ? this.users.find({ where: { id: In(userIds) } }) : Promise.resolve([]),
+      listingIds.length
+        ? this.listings.find({ where: { id: In(listingIds) } })
+        : Promise.resolve([]),
+    ]);
+    const userNames = new Map(users.map((u) => [u.id, u.name]));
+    const listingTitles = new Map(listings.map((l) => [l.id, l.title ?? '']));
+
+    const rows: Review[] = raw.map((r) => ({
+      id: r.id,
+      listingId: r.listingId,
+      listingTitle: listingTitles.get(r.listingId) ?? null,
+      seekerId: r.reviewerId,
+      seekerName: userNames.get(r.reviewerId) ?? null,
+      rating: r.rating,
+      text: r.comment,
+      // The review-service has no moderation state; everything is visible.
+      status: 'visible',
+      moderatedBy: null,
+      moderationReason: null,
+      createdAt: r.createdAt.toISOString(),
+    }));
+
+    return paginate(rows as unknown as Record<string, unknown>[], {
       page: query.page,
       limit: query.limit,
       q: query.q,
@@ -59,6 +75,7 @@ export class ReviewsService {
   }
 
   moderate(id: string, _body: { action: string; reason: string }): { ok: true } {
+    void id;
     return { ok: true };
   }
 }
