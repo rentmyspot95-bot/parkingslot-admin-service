@@ -161,9 +161,10 @@ export class UpstreamListing {
   @Column({ name: 'vehicle_types', type: 'varchar', array: true, default: () => "'{}'" })
   vehicleTypes!: string[];
 
-  /** GeoJSON Point — note `coordinates` is [lng, lat], not [lat, lng]. */
-  @Column({ type: 'jsonb', nullable: true })
-  location!: { type: string; coordinates: [number, number] } | null;
+  // NOTE: `listings.location` (jsonb GeoJSON Point) exists in some environments
+  // but NOT in the deployed one. TypeORM puts every mapped column in its SELECT,
+  // so mapping it 500s the whole listings query wherever the column is absent.
+  // Left unmapped deliberately until the schemas converge; `geo` is null instead.
 
   @Column({ type: 'jsonb', nullable: true })
   address!: UpstreamAddress | null;

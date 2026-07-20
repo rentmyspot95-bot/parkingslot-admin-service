@@ -35,16 +35,6 @@ function formatAddress(a: UpstreamListing['address']): string {
   return [a.street, a.area, a.city, a.state, a.pincode].filter(Boolean).join(', ');
 }
 
-/**
- * `listings.location` is a plain jsonb GeoJSON Point, so the coordinates come
- * back as [lng, lat] — the reverse of the {lat, lng} the console expects.
- */
-function toGeo(location: UpstreamListing['location']): { lat: number; lng: number } | null {
-  const [lng, lat] = location?.coordinates ?? [];
-  if (typeof lat !== 'number' || typeof lng !== 'number') return null;
-  return { lat, lng };
-}
-
 @Injectable()
 export class ListingsService {
   constructor(
@@ -70,7 +60,9 @@ export class ListingsService {
       hostName,
       title: l.title ?? '',
       address: formatAddress(l.address),
-      geo: toGeo(l.location),
+      // See UpstreamListing: the location column is not mapped, because it is
+      // absent in the deployed schema. Consumers must tolerate a null geo.
+      geo: null,
       photos,
       amenities,
       vehicleTypes: l.vehicleTypes ?? [],
