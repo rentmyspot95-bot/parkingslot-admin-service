@@ -35,6 +35,16 @@ function formatAddress(a: UpstreamListing['address']): string {
   return [a.street, a.area, a.city, a.state, a.pincode].filter(Boolean).join(', ');
 }
 
+/**
+ * `listings.location` is a plain jsonb GeoJSON Point, so the coordinates come
+ * back as [lng, lat] — the reverse of the {lat, lng} the console expects.
+ */
+function toGeo(location: UpstreamListing['location']): { lat: number; lng: number } | null {
+  const [lng, lat] = location?.coordinates ?? [];
+  if (typeof lat !== 'number' || typeof lng !== 'number') return null;
+  return { lat, lng };
+}
+
 @Injectable()
 export class ListingsService {
   constructor(
@@ -60,9 +70,7 @@ export class ListingsService {
       hostName,
       title: l.title ?? '',
       address: formatAddress(l.address),
-      // location is a PostGIS geography column and is not hydrated as GeoJSON
-      // by the driver here, so lat/lng are not surfaced.
-      geo: null,
+      geo: toGeo(l.location),
       photos,
       amenities,
       vehicleTypes: l.vehicleTypes ?? [],

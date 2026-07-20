@@ -161,6 +161,10 @@ export class UpstreamListing {
   @Column({ name: 'vehicle_types', type: 'varchar', array: true, default: () => "'{}'" })
   vehicleTypes!: string[];
 
+  /** GeoJSON Point — note `coordinates` is [lng, lat], not [lat, lng]. */
+  @Column({ type: 'jsonb', nullable: true })
+  location!: { type: string; coordinates: [number, number] } | null;
+
   @Column({ type: 'jsonb', nullable: true })
   address!: UpstreamAddress | null;
 
