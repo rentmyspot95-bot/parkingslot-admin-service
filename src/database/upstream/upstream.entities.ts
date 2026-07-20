@@ -252,8 +252,25 @@ export class UpstreamBooking {
   @Column({ type: 'varchar', nullable: true })
   listing_address!: string | null;
 
+  /**
+   * Append-only transition log written by the booking service's state machine.
+   * The admin view reads it to recover facts the flat columns don't carry —
+   * when a booking was decided, and which of the two paths into `expired` it
+   * took (owner never responded vs. the payment hold lapsed).
+   */
+  @Column({ type: 'jsonb', nullable: true })
+  status_timeline!: Array<{
+    status: string;
+    timestamp: string;
+    actor_id?: string;
+    note?: string;
+  }> | null;
+
   @Column({ type: 'timestamptz' })
   created_at!: Date;
+
+  @Column({ type: 'timestamptz' })
+  updated_at!: Date;
 }
 
 // ── payments ──────────────────────────────────────────────────────────────────

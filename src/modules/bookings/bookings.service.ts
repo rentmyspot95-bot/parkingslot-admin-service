@@ -29,11 +29,18 @@ interface Booking {
   status: string;
   bookingMode: string;
   responseDeadline?: string;
+  decidedAt?: string;
   ownerRejectReason?: string | null;
   autoRejected: boolean;
   paymentId: string;
   createdAt: string;
 }
+
+/**
+ * Statuses that end a booking's life. Reaching one of these is the "decision"
+ * the admin console's rejection log sorts and reports on.
+ */
+const TERMINAL_STATUSES = new Set(['completed', 'cancelled', 'rejected', 'expired']);
 
 interface OwnerApprovalStats {
   hostId: string;
@@ -54,6 +61,49 @@ export class BookingsService {
     private readonly users: Repository<UpstreamUser>,
   ) {}
 
+  /**
+   * Did this booking reach `expired` because the owner never answered a
+   * request-to-book, as opposed to the seeker's payment hold lapsing?
+   *
+   * Both paths call the same `toExpired()` transition, so the flat `status`
+   * column can't tell them apart — but the timeline can: auto-reject enters
+   * from `pending`, payment expiry enters from `pending_payment`.
+   */
+  private isOwnerNonResponse(b: UpstreamBooking): boolean {
+    if (b.status !== 'expired') return false;
+
+    const timeline = b.status_timeline ?? [];
+    const expiredAt = timeline.findIndex((e) => e.status === 'expired');
+    if (expiredAt > 0) return timeline[expiredAt - 1].status === 'pending';
+
+    // Pre-timeline rows: fall back to shape. Only request-to-book bookings ever
+    // carry an owner-response deadline, so this is right for the common case and
+    // can misread a request-to-book that was approved and then lapsed on payment.
+    return !b.is_instant && Boolean(b.owner_response_deadline ?? b.auto_reject_at);
+  }
+
+  /** When the booking reached its current terminal status, if it has one. */
+  private decidedAt(b: UpstreamBooking): string | undefined {
+    if (!TERMINAL_STATUSES.has(b.status)) return undefined;
+
+    const entry = [...(b.status_timeline ?? [])]
+      .reverse()
+      .find((e) => e.status === b.status);
+    const at = entry ? new Date(entry.timestamp) : b.updated_at;
+    return Number.isNaN(at.getTime()) ? undefined : at.toISOString();
+  }
+
+  /**
+   * Project the domain status onto the vocabulary the admin console speaks.
+   * The console distinguishes owner-approval states that the booking service
+   * folds into generic `pending` / `expired`.
+   */
+  private adminStatus(b: UpstreamBooking): string {
+    if (b.status === 'pending' && !b.is_instant) return 'pending_owner_approval';
+    if (this.isOwnerNonResponse(b)) return 'auto_rejected';
+    return b.status;
+  }
+
   private toBooking(b: UpstreamBooking, names: Map<string, string>): Booking {
     const deadline = b.owner_response_deadline ?? b.auto_reject_at;
     return {
@@ -71,11 +121,12 @@ export class BookingsService {
       currency: 'INR',
       commission: toPaise(b.service_fee),
       netToHost: toPaise(b.base_amount),
-      status: b.status,
+      status: this.adminStatus(b),
       bookingMode: b.is_instant ? 'instant_book' : 'request_to_book',
       responseDeadline: deadline ? deadline.toISOString() : undefined,
+      decidedAt: this.decidedAt(b),
       ownerRejectReason: b.status === 'rejected' ? b.cancel_reason : null,
-      autoRejected: b.status === 'expired',
+      autoRejected: this.isOwnerNonResponse(b),
       paymentId: b.payment_id ?? '',
       createdAt: b.created_at.toISOString(),
     };
@@ -134,13 +185,17 @@ export class BookingsService {
   }
 
   async ownerApprovalStats(hostId: string): Promise<OwnerApprovalStats> {
-    const rows = await this.bookings.find({ where: { owner_id: hostId } });
+    // Owner responsiveness is only meaningful for bookings the owner was
+    // actually asked to approve — instant-book never reaches them.
+    const rows = (await this.bookings.find({ where: { owner_id: hostId } })).filter(
+      (b) => !b.is_instant,
+    );
     const pendingCount = rows.filter((b) => b.status === 'pending').length;
     const approvedCount = rows.filter((b) =>
       ['confirmed', 'active', 'completed'].includes(b.status),
     ).length;
     const rejectedCount = rows.filter((b) => b.status === 'rejected').length;
-    const autoRejectedCount = rows.filter((b) => b.status === 'expired').length;
+    const autoRejectedCount = rows.filter((b) => this.isOwnerNonResponse(b)).length;
     const decided = approvedCount + rejectedCount + autoRejectedCount;
     const rejectionRate = decided
       ? Math.round(((rejectedCount + autoRejectedCount) / decided) * 1000) / 10
