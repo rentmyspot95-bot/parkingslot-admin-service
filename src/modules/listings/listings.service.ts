@@ -4,7 +4,11 @@ import { In, Repository } from 'typeorm';
 import { paginate } from '../../common/util/paginate';
 import { toPaise } from '../../common/util/money';
 import type { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
-import { NotFoundDomainException } from '../../common/errors/domain.exception';
+import {
+  BadRequestDomainException,
+  NotFoundDomainException,
+} from '../../common/errors/domain.exception';
+import { InternalServiceClient } from '../../common/http/internal-service.client';
 import {
   UpstreamListing,
   UpstreamUser,
@@ -42,6 +46,7 @@ export class ListingsService {
     private readonly listings: Repository<UpstreamListing>,
     @InjectRepository(UpstreamUser, UPSTREAM_CONNECTION)
     private readonly users: Repository<UpstreamUser>,
+    private readonly internal: InternalServiceClient,
   ) {}
 
   private toListing(l: UpstreamListing, hostName: string): Listing {
@@ -108,9 +113,33 @@ export class ListingsService {
     return this.toListing(listing, names.get(listing.ownerId) ?? listing.ownerId);
   }
 
-  async moderate(id: string, _body: { action: string; note?: string }): Promise<{ ok: true }> {
-    await this.getOne(id);
-    return { ok: true };
+  /**
+   * Approve or reject a listing awaiting review.
+   *
+   * Was a stub that discarded the body and returned `{ ok: true }` — so an
+   * operator could reject a listing, see success, and change nothing. The write
+   * goes to listing-service because the upstream connection here is read-only.
+   */
+  async moderate(
+    id: string,
+    body: { action: string; note?: string },
+  ): Promise<{ ok: true; status: string }> {
+    const decision = body.action === 'approve' ? 'approve' : 'reject';
+
+    if (decision === 'reject' && !body.note?.trim()) {
+      throw new BadRequestDomainException(
+        'A note is required when rejecting a listing — it is shown to the owner.',
+      );
+    }
+
+    const result = await this.internal.request<{ status: string }>({
+      baseUrlKey: 'LISTING_SERVICE_BASE_URL',
+      path: `/api/v1/internal/listings/${id}/moderate`,
+      method: 'POST',
+      body: { decision, reason: body.note },
+    });
+
+    return { ok: true, status: result.status };
   }
 
   async update(id: string, body: Partial<Listing>): Promise<{ ok: true } & Partial<Listing>> {

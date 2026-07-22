@@ -13,6 +13,12 @@ export class NotFoundDomainException extends DomainException {
   }
 }
 
+export class BadRequestDomainException extends DomainException {
+  constructor(message = 'Invalid request') {
+    super('BAD_REQUEST', message, HttpStatus.BAD_REQUEST);
+  }
+}
+
 export class ForbiddenDomainException extends DomainException {
   constructor(message = 'Forbidden') {
     super('FORBIDDEN', message, HttpStatus.FORBIDDEN);

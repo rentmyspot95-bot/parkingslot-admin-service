@@ -7,10 +7,11 @@ import {
   UpstreamUser,
   UPSTREAM_CONNECTION,
 } from '../../database/upstream/upstream.entities';
+import { InternalServiceClient } from '../../common/http/internal-service.client';
 
 @Module({
   imports: [TypeOrmModule.forFeature([UpstreamListing, UpstreamUser], UPSTREAM_CONNECTION)],
   controllers: [ListingsController],
-  providers: [ListingsService],
+  providers: [ListingsService, InternalServiceClient],
 })
 export class ListingsModule {}
