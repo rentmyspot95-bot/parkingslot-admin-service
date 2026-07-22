@@ -1,0 +1,18 @@
+# Force devDependencies to be installed during the build.
+#
+# This service has NODE_ENV=production set as a Railway variable. Railway
+# injects service variables into the build as well as the runtime, and npm
+# treats NODE_ENV=production as an implicit --omit=dev. The build then failed
+# with "sh: 1: nest: not found", because @nestjs/cli — like typescript and
+# @nestjs/schematics — is a devDependency.
+#
+# Confirmed rather than assumed: the failing build logged "added 258 packages,
+# audited 259", and this project's production-only tree is exactly 259 entries
+# (666 with dev). So the build genuinely installed production deps only.
+#
+# Fixing it here rather than by dropping NODE_ENV=production keeps that variable
+# doing its real job at runtime, and fixing it here rather than by promoting
+# @nestjs/cli to dependencies keeps the runtime image from carrying the whole
+# toolchain — and keeps package.json identical in shape to the other services.
+[phases.install]
+cmds = ["npm ci --include=dev"]
